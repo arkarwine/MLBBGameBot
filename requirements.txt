@@ -1,0 +1,4 @@
+python-telegram-bot==22.8
+mwparserfromhell>=0.7,<0.8
+python-dotenv>=1.1,<2
+
