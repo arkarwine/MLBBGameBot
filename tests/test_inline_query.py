@@ -4,6 +4,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from telegram import InlineQueryResultArticle
+from telegram.constants import ChatType
+
 from bot import QuizEngine, inline_answer, inline_query
 from storage import ScoreStore
 from wiki_dialogues import Dialogue
@@ -73,6 +76,39 @@ class InlineQueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].voice_file_id, "voice-id")
         self.assertNotIn("Hidden Miya line", results[0].caption)
+
+    async def test_inline_query_in_group_returns_poll_instruction_not_buttons(self) -> None:
+        dialogues = [
+            Dialogue("Miya", "Hidden Miya line", "m.ogg", "Miya/Audio"),
+            Dialogue("Layla", "Layla line", "l.ogg", "Layla/Audio"),
+            Dialogue("Clint", "Clint line", "c.ogg", "Clint/Audio"),
+            Dialogue("Bruno", "Bruno line", "b.ogg", "Bruno/Audio"),
+        ]
+        inline = SimpleNamespace(
+            query="Miya",
+            chat_type=ChatType.GROUP,
+            from_user=SimpleNamespace(id=123),
+            answer=AsyncMock(),
+        )
+        update = SimpleNamespace(inline_query=inline)
+        application = SimpleNamespace(
+            bot_data={
+                "quiz_engine": QuizEngine(dialogues),
+                "inline_questions": {},
+                "inline_order": [],
+            }
+        )
+        context = SimpleNamespace(application=application)
+
+        with patch("bot._inline_voice_file_id", new=AsyncMock()) as voice_cache:
+            await inline_query(update, context)
+
+        voice_cache.assert_not_awaited()
+        results = inline.answer.await_args.args[0]
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0], InlineQueryResultArticle)
+        self.assertEqual(results[0].reply_markup, None)
+        self.assertIn("/quiz", results[0].input_message_content.message_text)
 
 
 if __name__ == "__main__":

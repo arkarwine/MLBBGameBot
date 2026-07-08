@@ -14,7 +14,9 @@ from telegram import (
     Bot,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQueryResultArticle,
     InlineQueryResultCachedVoice,
+    InputTextMessageContent,
     Update,
 )
 from telegram.constants import ChatType, ParseMode, PollType
@@ -50,6 +52,7 @@ DIFFICULTIES = {
 }
 DEFAULT_DIFFICULTY = "normal"
 RANDOM_DIFFICULTY = "random"
+INLINE_DM_CHAT_TYPES = {None, ChatType.PRIVATE, ChatType.SENDER}
 
 
 def _question_key(text: str) -> str:
@@ -764,6 +767,20 @@ async def _inline_voice_file_id(
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.inline_query
+    chat_type = getattr(query, "chat_type", None)
+    if chat_type not in INLINE_DM_CHAT_TYPES:
+        result = InlineQueryResultArticle(
+            id="group-poll-limitation",
+            title="Use /quiz for group polls",
+            description="Telegram inline mode cannot create native quiz polls.",
+            input_message_content=InputTextMessageContent(
+                "Native quiz polls cannot be sent from inline mode.\n\n"
+                "Use /quiz in this group to start a poll-based MLBB audio quiz."
+            ),
+        )
+        await query.answer([result], cache_time=0, is_personal=True)
+        return
+
     engine: QuizEngine = context.application.bot_data["quiz_engine"]
     pool = _inline_dialogue_pool(engine, query.query)
     dialogue = random.choice(pool)
