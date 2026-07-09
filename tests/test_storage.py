@@ -63,6 +63,23 @@ class ScoreStoreTests(unittest.TestCase):
         reopened = ScoreStore(self.database)
         self.assertEqual(reopened.get_voice_file_id("line.ogg"), "telegram-file-id")
 
+    def test_auto_quiz_chats_persist(self) -> None:
+        self.store.upsert_auto_quiz_chat(
+            chat_id=-100123,
+            chat_type="supergroup",
+            title="MLBB Fans",
+        )
+
+        reopened = ScoreStore(self.database)
+        chats = reopened.list_auto_quiz_chats()
+        self.assertEqual(len(chats), 1)
+        self.assertEqual(chats[0].chat_id, -100123)
+        self.assertEqual(chats[0].chat_type, "supergroup")
+        self.assertEqual(chats[0].title, "MLBB Fans")
+
+        reopened.disable_auto_quiz_chat(-100123)
+        self.assertEqual(reopened.list_auto_quiz_chats(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,13 @@ class UserScore:
         return round(self.correct * 100 / self.answered) if self.answered else 0
 
 
+@dataclass(frozen=True)
+class AutoQuizChat:
+    chat_id: int
+    chat_type: str
+    title: str = ""
+
+
 class ScoreStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -76,6 +83,14 @@ class ScoreStore:
                     audio_file TEXT PRIMARY KEY,
                     file_id TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS auto_quiz_chats (
+                    chat_id INTEGER PRIMARY KEY,
+                    chat_type TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_quiz_at TEXT
                 );
                 """
             )
@@ -204,4 +219,66 @@ class ScoreStore:
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (audio_file, file_id),
+            )
+
+    def upsert_auto_quiz_chat(
+        self,
+        *,
+        chat_id: int,
+        chat_type: str,
+        title: str = "",
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO auto_quiz_chats (chat_id, chat_type, title, enabled)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    chat_type = excluded.chat_type,
+                    title = excluded.title,
+                    enabled = 1,
+                    seen_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, chat_type, title),
+            )
+
+    def disable_auto_quiz_chat(self, chat_id: int) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE auto_quiz_chats
+                SET enabled = 0, seen_at = CURRENT_TIMESTAMP
+                WHERE chat_id = ?
+                """,
+                (chat_id,),
+            )
+
+    def list_auto_quiz_chats(self) -> list[AutoQuizChat]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT chat_id, chat_type, title
+                FROM auto_quiz_chats
+                WHERE enabled = 1
+                ORDER BY seen_at ASC
+                """
+            ).fetchall()
+        return [
+            AutoQuizChat(
+                chat_id=int(row["chat_id"]),
+                chat_type=str(row["chat_type"]),
+                title=str(row["title"]),
+            )
+            for row in rows
+        ]
+
+    def mark_auto_quiz_sent(self, chat_id: int) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE auto_quiz_chats
+                SET last_quiz_at = CURRENT_TIMESTAMP
+                WHERE chat_id = ?
+                """,
+                (chat_id,),
             )

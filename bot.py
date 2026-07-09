@@ -19,15 +19,18 @@ from telegram import (
     InputTextMessageContent,
     Update,
 )
-from telegram.constants import ChatType, ParseMode, PollType
-from telegram.error import NetworkError, TelegramError
+from telegram.constants import ChatMemberStatus, ChatType, ParseMode, PollType
+from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     InlineQueryHandler,
+    MessageHandler,
     PollAnswerHandler,
+    filters,
 )
 from telegram.request import HTTPXRequest
 
@@ -53,6 +56,13 @@ DIFFICULTIES = {
 DEFAULT_DIFFICULTY = "normal"
 RANDOM_DIFFICULTY = "random"
 INLINE_DM_CHAT_TYPES = {None, ChatType.PRIVATE, ChatType.SENDER}
+AUTO_QUIZ_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL}
+AUTO_QUIZ_ACTIVE_STATUSES = {
+    ChatMemberStatus.ADMINISTRATOR,
+    ChatMemberStatus.MEMBER,
+    ChatMemberStatus.OWNER,
+}
+DEFAULT_AUTO_QUIZ_INTERVAL_SECONDS = 60 * 60
 
 
 def _question_key(text: str) -> str:
@@ -62,6 +72,27 @@ def _question_key(text: str) -> str:
 def _is_group(update: Update) -> bool:
     chat = update.effective_chat
     return bool(chat and chat.type in {ChatType.GROUP, ChatType.SUPERGROUP})
+
+
+def _is_auto_quiz_chat_type(chat_type: str | None) -> bool:
+    return chat_type in AUTO_QUIZ_CHAT_TYPES
+
+
+def _remember_auto_quiz_chat(chat: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_type = getattr(chat, "type", None)
+    if not _is_auto_quiz_chat_type(chat_type):
+        return
+    title = (
+        getattr(chat, "title", None)
+        or getattr(chat, "username", None)
+        or str(getattr(chat, "id", ""))
+    )
+    store: ScoreStore = context.application.bot_data["score_store"]
+    store.upsert_auto_quiz_chat(
+        chat_id=int(getattr(chat, "id")),
+        chat_type=str(chat_type),
+        title=str(title),
+    )
 
 
 def _state_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> dict:
@@ -356,6 +387,92 @@ def _group_poll_explanation(dialogue: Dialogue) -> str:
     return explanation[:200]
 
 
+async def _send_quiz_audio_or_text(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    dialogue: Dialogue,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None,
+) -> bool:
+    media_cache: dict[str, tuple[str, str]] = context.application.bot_data["media_cache"]
+    cached_media = media_cache.get(dialogue.audio_file)
+
+    try:
+        if cached_media:
+            media_kind, file_id = cached_media
+            if media_kind == "voice":
+                await context.bot.send_voice(
+                    chat_id=chat_id,
+                    voice=file_id,
+                    caption=text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=file_id,
+                    caption=text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML,
+                )
+            return True
+
+        audio_service: AudioService = context.application.bot_data["audio_service"]
+        prepared = await audio_service.prepare(dialogue.audio_file)
+        if prepared.opus:
+            try:
+                message = await context.bot.send_voice(
+                    chat_id=chat_id,
+                    voice=prepared.opus,
+                    filename=f"{dialogue.hero}-voice.ogg",
+                    caption=text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML,
+                )
+                media_cache[dialogue.audio_file] = ("voice", message.voice.file_id)
+                try:
+                    context.application.bot_data["score_store"].set_voice_file_id(
+                        dialogue.audio_file,
+                        message.voice.file_id,
+                    )
+                except Exception:
+                    LOGGER.warning("Could not persist Telegram voice file ID", exc_info=True)
+                return True
+            except TelegramError:
+                LOGGER.warning("Telegram rejected voice format; sending original as a document")
+                message = await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=prepared.original,
+                    filename=dialogue.audio_file,
+                    caption=text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML,
+                )
+                media_cache[dialogue.audio_file] = ("document", message.document.file_id)
+                return True
+
+        message = await context.bot.send_document(
+            chat_id=chat_id,
+            document=prepared.original,
+            filename=dialogue.audio_file,
+            caption=text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+        )
+        media_cache[dialogue.audio_file] = ("document", message.document.file_id)
+        return True
+    except Exception:
+        LOGGER.exception("Could not attach %s; sending a text-only question", dialogue.audio_file)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+        )
+        return False
+
+
 async def _start_group_poll(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -446,81 +563,14 @@ async def _show_question(
     group_chat = _is_group(update)
     markup = None if group_chat else _keyboard(question_id, choices)
 
-    audio_service: AudioService = context.application.bot_data["audio_service"]
-    media_cache: dict[str, tuple[str, str]] = context.application.bot_data["media_cache"]
-    cached_media = media_cache.get(dialogue.audio_file)
     chat_id = update.effective_chat.id
-
-    try:
-        if cached_media:
-            media_kind, file_id = cached_media
-            if media_kind == "voice":
-                message = await context.bot.send_voice(
-                    chat_id=chat_id,
-                    voice=file_id,
-                    caption=text,
-                    reply_markup=markup,
-                    parse_mode=ParseMode.HTML,
-                )
-            else:
-                message = await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=file_id,
-                    caption=text,
-                    reply_markup=markup,
-                    parse_mode=ParseMode.HTML,
-                )
-        else:
-            prepared = await audio_service.prepare(dialogue.audio_file)
-            if prepared.opus:
-                try:
-                    message = await context.bot.send_voice(
-                        chat_id=chat_id,
-                        voice=prepared.opus,
-                        filename=f"{dialogue.hero}-voice.ogg",
-                        caption=text,
-                        reply_markup=markup,
-                        parse_mode=ParseMode.HTML,
-                    )
-                    media_cache[dialogue.audio_file] = ("voice", message.voice.file_id)
-                    try:
-                        context.application.bot_data["score_store"].set_voice_file_id(
-                            dialogue.audio_file,
-                            message.voice.file_id,
-                        )
-                    except Exception:
-                        LOGGER.warning("Could not persist Telegram voice file ID", exc_info=True)
-                except TelegramError:
-                    LOGGER.warning("Telegram rejected voice format; sending original as a document")
-                    message = await context.bot.send_document(
-                        chat_id=chat_id,
-                        document=prepared.original,
-                        filename=dialogue.audio_file,
-                        caption=text,
-                        reply_markup=markup,
-                        parse_mode=ParseMode.HTML,
-                    )
-                    media_cache[dialogue.audio_file] = ("document", message.document.file_id)
-            else:
-                message = await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=prepared.original,
-                    filename=dialogue.audio_file,
-                    caption=text,
-                    reply_markup=markup,
-                    parse_mode=ParseMode.HTML,
-                )
-                media_cache[dialogue.audio_file] = ("document", message.document.file_id)
-
-        state_data["question"]["media"] = True
-    except Exception:
-        LOGGER.exception("Could not attach %s; sending a text-only question", dialogue.audio_file)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=markup,
-            parse_mode=ParseMode.HTML,
-        )
+    state_data["question"]["media"] = await _send_quiz_audio_or_text(
+        context,
+        chat_id,
+        dialogue,
+        text,
+        markup,
+    )
     if group_chat:
         await _start_group_poll(
             update,
@@ -531,6 +581,137 @@ async def _show_question(
             str(quiz_mode),
             question_id,
         )
+
+
+async def _send_auto_quiz_to_chat(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    chat_type: str,
+    seen_audio: set[str],
+) -> None:
+    engine: QuizEngine = context.application.bot_data["quiz_engine"]
+    quiz_mode = RANDOM_DIFFICULTY
+    difficulty = _resolve_quiz_difficulty(quiz_mode)
+    dialogue, choices = engine.new_question(difficulty, seen_audio)
+    seen_audio.add(dialogue.audio_file)
+    question_id = secrets.token_hex(4)
+
+    await _send_quiz_audio_or_text(
+        context,
+        chat_id,
+        dialogue,
+        _question_text(dialogue, difficulty),
+        reply_markup=None,
+    )
+
+    correct_answer = QuizEngine.answer_label(dialogue, difficulty)
+    correct_index = choices.index(correct_answer)
+    heading = "Identify the hero and skin" if difficulty == "expert" else "Who is this hero?"
+    poll_message = await context.bot.send_poll(
+        chat_id=chat_id,
+        question=f"{heading} • {DIFFICULTIES[difficulty]['label']}",
+        options=choices,
+        is_anonymous=chat_type == ChatType.CHANNEL,
+        type=PollType.QUIZ,
+        allows_multiple_answers=False,
+        correct_option_id=correct_index,
+        explanation=_group_poll_explanation(dialogue),
+    )
+    poll_state = {
+        "chat_id": chat_id,
+        "message_id": poll_message.message_id,
+        "poll_id": poll_message.poll.id,
+        "dialogue": dialogue,
+        "choices": choices,
+        "correct_index": correct_index,
+        "difficulty": difficulty,
+        "quiz_mode": quiz_mode,
+        "scored_users": set(),
+    }
+    context.application.bot_data["group_polls"][question_id] = poll_state
+    context.application.bot_data["poll_index"][poll_message.poll.id] = question_id
+    poll_order: list[str] = context.application.bot_data["poll_order"]
+    poll_order.append(question_id)
+    if len(poll_order) > 500:
+        oldest = poll_order.pop(0)
+        old_state = context.application.bot_data["group_polls"].pop(oldest, None)
+        if old_state:
+            context.application.bot_data["poll_index"].pop(old_state["poll_id"], None)
+
+
+async def hourly_auto_quiz(context: ContextTypes.DEFAULT_TYPE) -> None:
+    store: ScoreStore = context.application.bot_data["score_store"]
+    seen_by_chat: dict[int, set[str]] = context.application.bot_data["auto_quiz_seen_audio"]
+    for chat in store.list_auto_quiz_chats():
+        if not _is_auto_quiz_chat_type(chat.chat_type):
+            continue
+        seen_audio = seen_by_chat.setdefault(chat.chat_id, set())
+        try:
+            await _send_auto_quiz_to_chat(
+                context,
+                chat.chat_id,
+                chat.chat_type,
+                seen_audio,
+            )
+            store.mark_auto_quiz_sent(chat.chat_id)
+        except (Forbidden, BadRequest) as error:
+            store.disable_auto_quiz_chat(chat.chat_id)
+            LOGGER.warning(
+                "Disabled hourly auto quiz for %s after Telegram rejected send: %s",
+                chat.chat_id,
+                error,
+            )
+        except Exception:
+            LOGGER.exception("Could not send hourly auto quiz to %s", chat.chat_id)
+
+
+async def track_auto_quiz_chat(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    chat = update.effective_chat
+    if chat:
+        try:
+            _remember_auto_quiz_chat(chat, context)
+        except Exception:
+            LOGGER.exception("Could not persist auto-quiz chat %s", chat.id)
+
+
+async def track_my_chat_member(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    member_update = update.my_chat_member
+    if not member_update:
+        return
+    chat = member_update.chat
+    if not _is_auto_quiz_chat_type(chat.type):
+        return
+
+    store: ScoreStore = context.application.bot_data["score_store"]
+    new_status = member_update.new_chat_member.status
+    try:
+        if new_status in AUTO_QUIZ_ACTIVE_STATUSES:
+            _remember_auto_quiz_chat(chat, context)
+        else:
+            store.disable_auto_quiz_chat(chat.id)
+    except Exception:
+        LOGGER.exception("Could not update auto-quiz chat membership for %s", chat.id)
+
+
+def _auto_quiz_interval_seconds() -> int:
+    raw_value = os.getenv(
+        "AUTO_QUIZ_INTERVAL_SECONDS",
+        str(DEFAULT_AUTO_QUIZ_INTERVAL_SECONDS),
+    )
+    try:
+        return max(60, int(raw_value))
+    except ValueError:
+        LOGGER.warning(
+            "Invalid AUTO_QUIZ_INTERVAL_SECONDS=%r; using hourly schedule",
+            raw_value,
+        )
+        return DEFAULT_AUTO_QUIZ_INTERVAL_SECONDS
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1005,6 +1186,23 @@ def main() -> None:
     application.bot_data["poll_order"] = []
     application.bot_data["inline_questions"] = {}
     application.bot_data["inline_order"] = []
+    application.bot_data["auto_quiz_seen_audio"] = {}
+
+    auto_quiz_interval = _auto_quiz_interval_seconds()
+    if application.job_queue is None:
+        raise RuntimeError(
+            "Hourly auto quizzes require the PTB job queue. "
+            "Install dependencies with: pip install -r requirements.txt"
+        )
+    application.job_queue.run_repeating(
+        hourly_auto_quiz,
+        interval=auto_quiz_interval,
+        first=auto_quiz_interval,
+        name="hourly-auto-quiz",
+    )
+    LOGGER.info("Hourly auto quiz enabled every %d seconds", auto_quiz_interval)
+
+    application.add_handler(ChatMemberHandler(track_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("quiz", quiz))
     application.add_handler(CommandHandler("play", play))
@@ -1015,6 +1213,10 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(session_results, pattern=r"^session_results$"))
     application.add_handler(PollAnswerHandler(group_poll_answer))
     application.add_handler(InlineQueryHandler(inline_query))
+    application.add_handler(
+        MessageHandler(filters.ChatType.GROUPS | filters.ChatType.CHANNEL, track_auto_quiz_chat),
+        group=1,
+    )
     application.add_error_handler(error_handler)
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,

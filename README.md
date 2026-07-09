@@ -22,6 +22,7 @@ Edit `.env`:
 ```dotenv
 TELEGRAM_BOT_TOKEN=your-real-token
 INLINE_CACHE_CHAT_ID=-1001234567890
+AUTO_QUIZ_INTERVAL_SECONDS=3600
 ```
 
 Run the bot:
@@ -55,6 +56,8 @@ Scores, streaks, the last quiz mode, and answer history are stored in `data/quiz
 ## Group chats
 
 In groups and supergroups, questions use non-anonymous Telegram quiz polls instead of answer buttons. Telegram marks the correct option and shows an explanation containing the hero, skin/voice set, and transcript. Group polls have no timeout and do not send splash art or a separate result message. Individual poll votes are included in persistent scores.
+
+The bot remembers groups, supergroups, and channels where it is present in `data/quiz.db` and sends an automatic random-difficulty quiz every hour. Set `AUTO_QUIZ_INTERVAL_SECONDS` only for development/testing; production should leave it at `3600`. Channel polls are sent anonymously by Telegram, so they do not produce per-user scores.
 
 ## Inline mode
 
